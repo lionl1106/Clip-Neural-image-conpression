@@ -1,0 +1,1 @@
+Documentation placeholder. Add design notes and extended API reference here.
