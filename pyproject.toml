@@ -1,0 +1,27 @@
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clip-feature-codec"
+version = "0.1.0"
+description = "CLIP feature compression + FAISS search + conditional decoding"
+authors = [{name="Your Name"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "open_clip_torch>=2.24.0",
+    "faiss-gpu; platform_system!='Windows'",
+    "faiss-cpu; platform_system=='Windows'",
+    "Pillow>=10.0.0",
+    "numpy>=1.24",
+    "tqdm>=4.66",
+    "zstandard>=0.22.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["clip_feature_codec", "clip_feature_codec.models", "clip_feature_codec.codecs", "clip_feature_codec.io", "clip_feature_codec.index", "clip_feature_codec.train", "clip_feature_codec.cli"]
