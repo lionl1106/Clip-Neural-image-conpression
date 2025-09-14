@@ -1,28 +1,11 @@
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-
-=======
->>>>>>> origin/master
->>>>>>> 164a03b44130c429459dffce95f5bcc4cd9a2e03
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "clip-feature-codec"
-<<<<<<< HEAD
 version = "0.3.0"
 description = "CLIP feature compression, diffusion-based decoder, and evaluation scripts"
-=======
-<<<<<<< HEAD
-version = "0.1.0"
-description = "CLIP feature compression + FAISS search + conditional decoding"
-=======
-version = "0.3.0"
-description = "CLIP feature compression, diffusion-based decoder, and evaluation scripts"
->>>>>>> origin/master
->>>>>>> 164a03b44130c429459dffce95f5bcc4cd9a2e03
 authors = [{name="Your Name"}]
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,26 +19,12 @@ dependencies = [
     "numpy>=1.24",
     "tqdm>=4.66",
     "zstandard>=0.22.0",
-<<<<<<< HEAD
     "lpips>=0.1.4",
     "scikit-image>=0.22.0",
-=======
-<<<<<<< HEAD
-=======
-    "lpips>=0.1.4",
-    "scikit-image>=0.22.0",
->>>>>>> origin/master
->>>>>>> 164a03b44130c429459dffce95f5bcc4cd9a2e03
 ]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-packages = ["clip_feature_codec", "clip_feature_codec.models", "clip_feature_codec.codecs", "clip_feature_codec.io", "clip_feature_codec.index", "clip_feature_codec.train", "clip_feature_codec.cli"]
-=======
->>>>>>> 164a03b44130c429459dffce95f5bcc4cd9a2e03
 packages = [
     "clip_feature_codec",
     "clip_feature_codec.models",
@@ -66,9 +35,4 @@ packages = [
     "clip_feature_codec.train",
     "clip_feature_codec.cli",
     "clip_feature_codec.eval",
-<<<<<<< HEAD
 ]
-=======
-]
->>>>>>> origin/master
->>>>>>> 164a03b44130c429459dffce95f5bcc4cd9a2e03
