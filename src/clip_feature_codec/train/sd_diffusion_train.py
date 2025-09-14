@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 import torch, torch.nn.functional as F
+import open_clip
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
@@ -63,74 +64,69 @@ def train_sd_diffusion(
     lr: float = 3e-4,
     model_name: str = "runwayml/stable-diffusion-v1-5",
     tv_w: float = 1e-5,
-    clip_w: float = 0.1,                 # ← 新增：CLIP 語義對齊權重
+    clip_w: float = 0.1,
+    mse_w: float = 1.0,
     device: str = "cuda",
     save_path: Path | None = None,
 ) -> Path:
     ds = StoreDataset(store_dir, size=out_size)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True, pin_memory=True)
 
-    # 以 meta 的維度初始化 adapter，使 cross-attn 對齊
     dec = StableDiffusionDecoder(model_name=model_name, device=device, clip_dim=ds.dim)
     sched = dec.noise_scheduler
     opt = torch.optim.AdamW(dec.adapter.parameters(), lr=lr)
 
-    # 準備 CLIP 做語義對齊（用 open_clip，維持 ViT-B/32）
+    # CLIP 模型（語義對齊）
     clip_model, _, _ = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
-    clip_model = clip_model.to(dec.device).eval()  # eval 模式，但仍允許反向傳播
+    clip_model = clip_model.to(dec.device).eval()
 
     gstep = 0
     save_path = Path(save_path or "sd_adapter_final.pt")
-
-    # 混合精度（可選）
     use_amp = (str(device).startswith("cuda") and torch.cuda.is_available())
 
     while gstep < steps:
         for z, x in dl:
             gstep += 1
-            x = x.to(dec.device, non_blocking=True)                # [-1,1], (B,3,H,W)
-            z = z.to(dec.device, non_blocking=True)                # (B, dim)
+            x = x.to(dec.device, non_blocking=True)
+            z = z.to(dec.device, non_blocking=True)
 
-            # 編成 latent_0
             with torch.no_grad():
-                lat0 = dec.encode(x)                               # (B,4,H/8,W/8)
+                lat0 = dec.encode(x)  # (B,4,H/8,W/8)
 
-            # 取時間步 & 合成 lat_t
             t = torch.randint(0, sched.config.num_train_timesteps, (x.size(0),), device=dec.device).long()
             noise = torch.randn_like(lat0)
-            alphas = sched.alphas_cumprod.to(dec.device)[t].view(-1, 1, 1, 1)   # ᾱ_t
-            lat_t = alphas.sqrt() * lat0 + (1 - alphas).sqrt() * noise
+            alphas = sched.alphas_cumprod.to(dec.device)[t].view(-1,1,1,1)
+            lat_t = alphas.sqrt()*lat0 + (1 - alphas).sqrt()*noise
 
             with torch.autocast(device_type="cuda", enabled=use_amp):
-                # 噪聲預測（MSE）
                 eps_hat = dec(lat_t, z, t)
-                loss = F.mse_loss(eps_hat, noise)
+                loss_mse = F.mse_loss(eps_hat, noise)          # 噪聲 MSE（Ho et al. 的 simple loss）
 
-                # 從 eps_hat 反推 x0 的 latent → decode 成影像
+                # 從 eps_hat 反推 x0 → 解碼像素
                 lat_x0 = (lat_t - (1 - alphas).sqrt() * eps_hat) / alphas.sqrt()
-                x0_pred = dec.decode(lat_x0)                       # (B,3,H,W), 範圍約 [-1,1]
+                x0_pred = dec.decode(lat_x0)                   # 近似 [-1,1]
 
-                # TV 正則
-                if tv_w > 0:
-                    loss = loss + tv_w * _total_variation(x0_pred)
+                loss_tv = _total_variation(x0_pred) if tv_w > 0 else x0_pred.new_tensor(0.0)
 
-                # CLIP 語義對齊（與原始 bitstream 的 CLIP 向量對齊）
+                loss_clip = x0_pred.new_tensor(0.0)
                 if clip_w > 0:
-                    img_in = _clip_preprocess_torch(x0_pred)       # resize 到 224 並正規化
-                    y_clip = clip_model.encode_image(img_in)       # (B, 512)
+                    img_in = _clip_preprocess_torch(x0_pred)   # 224 & CLIP normalize
+                    y_clip = clip_model.encode_image(img_in)
                     y_clip = y_clip / (y_clip.norm(dim=-1, keepdim=True) + 1e-9)
-
                     z_clip = z / (z.norm(dim=-1, keepdim=True) + 1e-9)
-                    # 以 cosine 相似最大化為目標 → 損失 = 1 - cos
-                    clip_loss = (1.0 - torch.cosine_similarity(y_clip.float(), z_clip.float()).mean())
-                    loss = loss + clip_w * clip_loss
+                    loss_clip = (1.0 - torch.cosine_similarity(y_clip.float(), z_clip.float()).mean())
+
+                # ★ 組合總 loss（可調 MSE 權重）
+                loss = mse_w * loss_mse + clip_w * loss_clip + tv_w * loss_tv
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
             if gstep % 100 == 0:
-                print(f"[train] step={gstep}/{steps} loss={loss.item():.4f}")
+                print(f"[train] step={gstep}/{steps} "
+                      f"total={loss.item():.4f}  mse={loss_mse.item():.4f}  "
+                      f"clip={loss_clip.item():.4f}  tv={loss_tv.item():.6f}")
             if gstep % 5000 == 0:
                 tmp = save_path.with_name(save_path.stem + f"_{gstep}.pt")
                 torch.save(dec.adapter.state_dict(), tmp)
@@ -147,9 +143,11 @@ if __name__ == "__main__":
     ap.add_argument("--store_dir", type=Path, required=True)
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=2)
-    ap.add_argument("--size", type=int, default=256)
+    ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--tv_w", type=float, default=0.0)
+    ap.add_argument("--tv_w", type=float, default=1e-5)
+    ap.add_argument("--clip_w", type=float, default=0.1)
+    ap.add_argument("--mse_w", type=float, default=1.0)
     ap.add_argument("--model_name", type=str, default="runwayml/stable-diffusion-v1-5")
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--out", type=Path, default=Path("sd_adapter_final.pt"))
@@ -162,6 +160,8 @@ if __name__ == "__main__":
         lr=args.lr,
         model_name=args.model_name,
         tv_w=args.tv_w,
+        clip_w=args.clip_w,
+        mse_w=args.mse_w,
         device=args.device,
         save_path=args.out,
     )
