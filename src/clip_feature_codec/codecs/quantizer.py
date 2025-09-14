@@ -1,10 +1,26 @@
+<<<<<<< HEAD
+=======
+"""
+Per-channel int8 quantizer for CLIP embeddings.
+
+The quantizer learns a linear scale and offset for each embedding dimension
+so that float32 vectors can be quantized to unsigned 8-bit integers.
+"""
+>>>>>>> origin/master
 
 from __future__ import annotations
 import numpy as np
 import torch
 
+<<<<<<< HEAD
 class PerChannelAffineQuantizer:
     """Per‑channel int8 quantizer for CLIP features."""
+=======
+
+class PerChannelAffineQuantizer:
+    """Affine per-channel quantizer."""
+
+>>>>>>> origin/master
     def __init__(self, num_bits: int = 8, eps: float = 1e-8) -> None:
         self.num_bits = num_bits
         self.eps = eps
@@ -29,4 +45,8 @@ class PerChannelAffineQuantizer:
             raise RuntimeError("Quantizer has not been fitted.")
         qf = torch.from_numpy(q.astype(np.float32))
         x = qf * self.scale + self.zero
+<<<<<<< HEAD
         return x.cpu().numpy()
+=======
+        return x.cpu().numpy()
+>>>>>>> origin/master
