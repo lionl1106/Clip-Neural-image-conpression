@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np, torch
 from PIL import Image
 
-from ..models.sd_decoder import StableDiffusionDecoder
+from ..models.sd_decoder import StableDiffusionDecoder  # type: ignore
 from ..io.bitstream import read_bitstream
 
 def load_codec_meta(store_dir: Path):
@@ -35,13 +35,13 @@ def main():
 
     # 1) 讀 meta + 正確解碼 bitstream
     scale, zero, dim = load_codec_meta(args.store_dir)
-    q = read_bitstream(args.bitstream)           # ← 正確的 .clp 解碼
+    q = read_bitstream(args.bitstream)
     if q.shape[0] != dim:
         raise ValueError(f"Bitstream dim {q.shape[0]} != meta dim {dim} "
                          f"(scale.shape={scale.shape}, zero.shape={zero.shape})")
 
     # 2) 反量化 + 正規化
-    z = q.astype("float32") * scale + zero       # 逐元素對應，形狀一致
+    z = q.astype("float32") * scale + zero
     z = l2_normalize_np(z[None, :]).astype("float32")  # (1, dim)
 
     # 3) 以正確的 clip_dim 初始化 decoder
