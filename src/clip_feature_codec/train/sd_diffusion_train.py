@@ -68,7 +68,7 @@ def train_sd_diffusion(
     device: str = "cuda",
     save_path: Path | None = None,
 ) -> Path:
-    ds = StoreDataset(store_dir, size=out_size)
+    ds = StoreDataset(store_dir)
     dl = DataLoader(StoreDataset(store_dir), batch_size=batch_size, shuffle=True, drop_last=True)
     dec = StableDiffusionDecoder(model_name=model_name, device=device, clip_dim=ds.dim)
     sched = dec.noise_scheduler
