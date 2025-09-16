@@ -26,23 +26,22 @@ def _load_meta(store_dir: Path):
     return scale, zero, dim
 
 class StoreDataset(Dataset):
-    def __init__(self, store_dir: Path, size: int = 256):
-        self.store_dir = Path(store_dir)
-        self.manifest = json.loads((self.store_dir / "manifest.json").read_text(encoding="utf-8"))
-        self.scale, self.zero, self.dim = _load_meta(self.store_dir)
-        self.size = int(size)
+    def __init__(self, store_dir: Path):
+        self.store = Path(store_dir)
+        self.manifest = json.loads((self.store / "manifest_latents.json").read_text())
+        meta = np.load(self.store / "codec_meta.npz")
+        self.scale = meta["scale"].astype("float32")
+        self.zero  = meta["zero"].astype("float32")
+        self.dim   = int(meta["dim"]) if "dim" in meta.files else int(self.scale.shape[0])
     def __len__(self): return len(self.manifest)
     def __getitem__(self, i: int):
         rec = self.manifest[i]
         q = read_bitstream(Path(rec["bitstream"]))
-        if q.shape[0] != self.dim:
-            raise ValueError(f"bitstream dim {q.shape[0]} != meta dim {self.dim}")
-        z = q.astype("float32") * self.scale + self.zero  # (dim,)
-        z = torch.from_numpy(z).float()
-        z = _l2_normalize(z, dim=-1)
-        img = Image.open(rec["image"]).convert("RGB").resize((self.size, self.size), Image.BICUBIC)
-        x = torch.from_numpy((np.array(img).astype("float32")/127.5-1.0)).permute(2,0,1)  # [-1,1]
-        return z, x
+        if q.shape[0] != self.dim: raise ValueError("dim mismatch")
+        z = torch.from_numpy((q.astype("float32")*self.scale+self.zero)).float()
+        z = z / (z.norm(dim=-1, keepdim=True)+1e-9)
+        lat = torch.from_numpy(np.load(rec["latent"])["lat"]).float()  # shape (4, H/8, W/8)
+        return z, lat
     
 def _clip_preprocess_torch(x: torch.Tensor, size: int = 224) -> torch.Tensor:
     """
@@ -70,53 +69,60 @@ def train_sd_diffusion(
     save_path: Path | None = None,
 ) -> Path:
     ds = StoreDataset(store_dir, size=out_size)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True, pin_memory=True)
-
+    dl = DataLoader(StoreDataset(store_dir), batch_size=batch_size, shuffle=True, drop_last=True)
     dec = StableDiffusionDecoder(model_name=model_name, device=device, clip_dim=ds.dim)
     sched = dec.noise_scheduler
     opt = torch.optim.AdamW(dec.adapter.parameters(), lr=lr)
 
-    # CLIP 模型（語義對齊）
+    for z, lat0 in dl:
+        z = z.to(dec.device); lat0 = lat0.to(dec.device)
+        t = torch.randint(0, sched.config.num_train_timesteps, (z.size(0),), device=dec.device).long()
+        noise = torch.randn_like(lat0)
+        a = sched.alphas_cumprod.to(dec.device)[t].view(-1,1,1,1)
+        lat_t = a.sqrt()*lat0 + (1-a).sqrt()*noise
+        eps_hat = dec(lat_t, z, t)
+        loss = F.mse_loss(eps_hat, noise)
+
+    # === CLIP 僅作特徵、也不更新權重（仍需保留反傳路徑，故不要 no_grad 包住） ===
     clip_model, _, _ = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
     clip_model = clip_model.to(dec.device).eval()
+    clip_model.requires_grad_(False)
 
     gstep = 0
     save_path = Path(save_path or "sd_adapter_final.pt")
     use_amp = (str(device).startswith("cuda") and torch.cuda.is_available())
 
     while gstep < steps:
-        for z, x in dl:
+        for z, lat0 in dl:                                     # ← DataLoader 直接給 (z, lat0)
             gstep += 1
-            x = x.to(dec.device, non_blocking=True)
-            z = z.to(dec.device, non_blocking=True)
+            z    = z.to(dec.device, non_blocking=True)
+            lat0 = lat0.to(dec.device, non_blocking=True)      # (B, 4, H/8, W/8) 並且已乘 scaling_factor
 
-            with torch.no_grad():
-                lat0 = dec.encode(x)  # (B,4,H/8,W/8)
-
-            t = torch.randint(0, sched.config.num_train_timesteps, (x.size(0),), device=dec.device).long()
-            noise = torch.randn_like(lat0)
+            bs = lat0.size(0)
+            t = torch.randint(0, sched.config.num_train_timesteps, (bs,), device=dec.device).long()
+            noise  = torch.randn_like(lat0)
             alphas = sched.alphas_cumprod.to(dec.device)[t].view(-1,1,1,1)
-            lat_t = alphas.sqrt()*lat0 + (1 - alphas).sqrt()*noise
+
+            lat_t  = alphas.sqrt() * lat0 + (1 - alphas).sqrt() * noise
 
             with torch.autocast(device_type="cuda", enabled=use_amp):
                 eps_hat = dec(lat_t, z, t)
-                loss_mse = F.mse_loss(eps_hat, noise)          # 噪聲 MSE（Ho et al. 的 simple loss）
+                loss_mse = F.mse_loss(eps_hat, noise)
 
-                # 從 eps_hat 反推 x0 → 解碼像素
-                lat_x0 = (lat_t - (1 - alphas).sqrt() * eps_hat) / alphas.sqrt()
-                x0_pred = dec.decode(lat_x0)                   # 近似 [-1,1]
+                # 從 eps_hat 反推 x0 的 latent → 解碼到像素空間（供 TV / CLIP 用）
+                lat_x0  = (lat_t - (1 - alphas).sqrt() * eps_hat) / alphas.sqrt()
+                x0_pred = dec.decode(lat_x0)                    # 解碼時會自動 / scaling_factor
 
                 loss_tv = _total_variation(x0_pred) if tv_w > 0 else x0_pred.new_tensor(0.0)
 
                 loss_clip = x0_pred.new_tensor(0.0)
                 if clip_w > 0:
-                    img_in = _clip_preprocess_torch(x0_pred)   # 224 & CLIP normalize
+                    img_in = _clip_preprocess_torch(x0_pred)    # 224 & CLIP normalize
                     y_clip = clip_model.encode_image(img_in)
                     y_clip = y_clip / (y_clip.norm(dim=-1, keepdim=True) + 1e-9)
                     z_clip = z / (z.norm(dim=-1, keepdim=True) + 1e-9)
                     loss_clip = (1.0 - torch.cosine_similarity(y_clip.float(), z_clip.float()).mean())
 
-                # ★ 組合總 loss（可調 MSE 權重）
                 loss = mse_w * loss_mse + clip_w * loss_clip + tv_w * loss_tv
 
             opt.zero_grad(set_to_none=True)
