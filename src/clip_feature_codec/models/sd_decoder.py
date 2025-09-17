@@ -13,13 +13,20 @@ class SDClipAdapter(nn.Module):
     Maps a single CLIP image embedding z_clip (B,512) to the UNet cross-attention space.
     Produces encoder_hidden_states of shape (B, S, D), where S is a small token count (default 1).
     """
-    def __init__(self, in_dim: int = 512, out_dim: int = 768, seq_len: int = 1):
+    def __init__(self, in_dim: int = 512, ctx_dim: int = 768,  hidden: int = 1024, n_tokens: int = 4):
         super().__init__()
-        self.seq_len = seq_len
-        self.proj = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, out_dim), nn.SiLU())
+        self.in_dim = in_dim
+        self.ctx_dim = ctx_dim
+        self.n_tokens = n_tokens
+        self.proj = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, ctx_dim * n_tokens),
+        )
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.proj(z)                         # (B, D)
-        h = h.unsqueeze(1).expand(-1, self.seq_len, -1)  # (B, S, D)
+        h = self.proj(z)                         # (B, n_tokens*ctx_dim)
+        h = h.view(z.size(0), self.n_tokens, self.ctx_dim)  # (B, N, ctx_dim)
         return h
 
 class StableDiffusionDecoder(nn.Module):
@@ -35,7 +42,12 @@ class StableDiffusionDecoder(nn.Module):
         for p in self.unet.parameters(): p.requires_grad_(False)
         self.scaling_factor = getattr(self.vae.config, "scaling_factor", 0.18215)
         cross_dim = getattr(self.unet.config, "cross_attention_dim", 768)
-        self.adapter = SDClipAdapter(in_dim=clip_dim, out_dim=cross_dim, seq_len=seq_len).to(self.device)
+        self.adapter = SDClipAdapter(
+             in_dim=clip_dim,
+             ctx_dim=cross_dim,
+             n_tokens=8,           
+             hidden=1024
+            ).to(self.device)
         self.noise_scheduler = DDIMScheduler.from_pretrained(model_name, subfolder="scheduler")
 
     @torch.no_grad()
@@ -51,8 +63,15 @@ class StableDiffusionDecoder(nn.Module):
         return imgs
 
     def forward(self, latents_t: torch.Tensor, z_clip: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        cond = self.adapter(z_clip.to(self.device))
-        return self.unet(latents_t.to(self.device), timesteps.to(self.device), encoder_hidden_states=cond).sample
+        cond = self.adapter(z_clip.to(self.device))        # (B, N, ctx_dim)
+        if cond.dim() == 2:
+            cond = cond.unsqueeze(1)                       # 保險：至少 (B,1,ctx_dim)
+        cond = cond.to(dtype=self.unet.dtype, device=self.device)
+        return self.unet(
+            latents_t.to(self.device, dtype=self.unet.dtype),
+            timesteps.to(self.device),
+            encoder_hidden_states=cond
+        ).sample
 
     @torch.no_grad()
     def sample(self, z_clip: torch.Tensor, shape: tuple[int,int,int,int], steps: int = 30, eta: float = 0.0, guidance_scale: float = 5.0) -> torch.Tensor:

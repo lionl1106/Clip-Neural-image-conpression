@@ -1,29 +1,53 @@
-# src/clip_feature_codec/train/sd_diffusion_train.py
+"""
+Training loop for the Stable Diffusion–based decoder.
+
+This script trains the ``StableDiffusionDecoder`` to predict the noise
+present in latent representations of images given a CLIP embedding and
+a diffusion timestep.  The model architecture is defined in
+``clip_feature_codec.models.sd_decoder`` and consists of a frozen
+variational autoencoder and UNet taken from a pre‑trained Stable
+Diffusion checkpoint, together with a small trainable adapter that
+maps CLIP image embeddings into the UNet’s cross‑attention space.
+
+Compared to ``diffusion_train.py``, which operates in pixel space,
+training in latent space dramatically reduces memory requirements and
+leverages the powerful prior learned by Stable Diffusion.  The loss
+function comprises a mean squared error on the predicted noise plus
+optional reconstruction, total variation and CLIP alignment terms.  Only
+the adapter parameters are updated during training; all other weights
+remain fixed.
+
+Usage example::
+
+    python -m clip_feature_codec.train.sd_diffusion_train \
+      --store_dir path/to/store \
+      --out_size 256 \
+      --epochs 20 \
+      --batch_size 4 \
+      --model_name runwayml/stable-diffusion-v1-5
+
+"""
+
 from __future__ import annotations
+
 import json
 from pathlib import Path
 from typing import Optional
+
 import numpy as np
-import torch, torch.nn.functional as F
-import open_clip
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+import timm
+from timm.data import resolve_model_data_config, create_transform
+
 from ..models.sd_decoder import StableDiffusionDecoder
-from ..io.bitstream import read_bitstream
-
-def _l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-9) -> torch.Tensor:
-    return x / (x.norm(dim=dim, keepdim=True) + eps)
-
-def _total_variation(x: torch.Tensor) -> torch.Tensor:
-    return (x[...,1:,:]-x[...,:-1,:]).abs().mean() + (x[...,:,1:]-x[...,:,:-1]).abs().mean()
-
-def _load_meta(store_dir: Path):
-    meta = np.load(store_dir / "codec_meta.npz")
-    scale = meta["scale"].astype("float32")
-    zero  = meta["zero"].astype("float32")
-    dim   = int(meta["dim"]) if "dim" in meta.files else int(scale.shape[0])
-    return scale, zero, dim
+from ..io.bitstream import read_bitstream  # local import to avoid cycle
 
 class StoreDataset(Dataset):
     def __init__(self, store_dir: Path):
@@ -42,132 +66,200 @@ class StoreDataset(Dataset):
         z = z / (z.norm(dim=-1, keepdim=True)+1e-9)
         lat = torch.from_numpy(np.load(rec["latent"])["lat"]).float()  # shape (4, H/8, W/8)
         return z, lat
-    
-def _clip_preprocess_torch(x: torch.Tensor, size: int = 224) -> torch.Tensor:
-    """
-    將 [-1,1] 影像張量轉成 CLIP 預期的正規化（0~1 → normalize）。
-    不用 PIL，直接在 GPU 上做 resize + normalize。
-    """
-    x = (x.clamp(-1, 1) + 1.0) / 2.0                     # [0,1]
-    x = F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False)
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=x.device).view(1, 3, 1, 1)
-    std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=x.device).view(1, 3, 1, 1)
-    x = (x - mean) / std
-    return x
+
+
+def total_variation(x: torch.Tensor) -> torch.Tensor:
+    """Compute isotropic total variation for a batch of images."""
+    tv_h = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
+    tv_w = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+    return tv_h + tv_w
+
 
 def train_sd_diffusion(
     store_dir: Path,
-    out_size: int = 512,
-    steps: int = 20000,
-    batch_size: int = 2,
-    lr: float = 3e-4,
+    out_size: int = 256,
+    epochs: int = 20,
+    batch_size: int = 4,
+    lr: float = 1e-4,
+    timesteps: int = 1000,
     model_name: str = "runwayml/stable-diffusion-v1-5",
-    tv_w: float = 1e-5,
+    recon_w: float = 0.05,
     clip_w: float = 0.1,
-    mse_w: float = 1.0,
-    device: str = "cuda",
-    save_path: Path | None = None,
+    tv_w: float = 1e-4,
+    device: str = 'cuda',
+    save_dir: Optional[Path] = None,
 ) -> Path:
+    """Train the latent diffusion decoder on all samples from the store.
+
+    Args:
+        store_dir: Directory containing ``manifest.json`` and bitstreams.
+        out_size: Training/resizing resolution.
+        epochs: Number of training epochs.
+        batch_size: Mini‑batch size.
+        lr: Learning rate for AdamW.
+        timesteps: Number of diffusion timesteps.  Must match the
+            scheduler’s ``num_train_timesteps``.
+        model_name: Hugging Face name or path of the Stable Diffusion
+            checkpoint to load.
+        recon_w: Weight of reconstruction L1 loss (in pixel space).
+        clip_w: Weight of CLIP alignment loss (computed every other
+            epoch).
+        tv_w: Weight of total variation regularization (in pixel space).
+        device: Device string (``'cuda'`` or ``'cpu'``).
+        save_dir: Optional directory to save checkpoints; defaults to
+            ``store_dir``.
+
+    Returns:
+        Path to the final adapter checkpoint.
+    """
+    save_dir = Path(save_dir or store_dir)
     ds = StoreDataset(store_dir)
-    dl = DataLoader(StoreDataset(store_dir), batch_size=batch_size, shuffle=True, drop_last=True)
-    dec = StableDiffusionDecoder(model_name=model_name, device=device, clip_dim=ds.dim)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    # Instantiate decoder
+    clip_dim = int(ds.zero.shape[0])
+    dec = StableDiffusionDecoder(model_name=model_name, device=device, clip_dim=clip_dim).to(device)
+    # Ensure scheduler timesteps match requested training timesteps
+    # dec.scheduler.set_timesteps(timesteps)
     sched = dec.noise_scheduler
+    
+    # Only train the adapter parameters
     opt = torch.optim.AdamW(dec.adapter.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device == 'cuda'))
+    autocast_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    # ----------------------------------------------------------------------
+    # DINOv2 model for perceptual alignment
+    #
+    # In place of the OpenAI CLIP model used previously, we load a
+    # pre‑trained DINOv2 vision transformer from the timm library.  The
+    # ``vit_base_patch14_dinov2.lvd142m`` checkpoint provides a 768‑dimensional
+    # embedding that captures robust visual features without supervision.
+    # We configure the model with ``num_classes=0`` to obtain the pooled
+    # embeddings directly.  The associated data configuration supplies the
+    # mean, standard deviation and input size for normalising images.
+    dino_model = timm.create_model(
+        'vit_base_patch14_dinov2.lvd142m',
+        pretrained=True,
+        num_classes=0
+    ).to(device).eval()
+    # Resolve data config for pre‑processing
+    dino_cfg = resolve_model_data_config(dino_model)
+    # Convert mean and std to tensors for broadcasting during normalisation
+    dino_mean = torch.tensor(dino_cfg['mean'], device=device).view(1, 3, 1, 1)
+    dino_std = torch.tensor(dino_cfg['std'], device=device).view(1, 3, 1, 1)
+    # Input spatial size expected by DINOv2 (e.g. (224, 224) for base models)
+    dino_size = (dino_cfg['input_size'][-2], dino_cfg['input_size'][-1])
+    # Precompute alpha_bar schedule for latent diffusion
+    al_bar = sched.alphas_cumprod.to(dec.device)
+    # al_bar = dec.scheduler.alphas_cumprod.to(device)  # shape (T,)
+    for ep in range(epochs):
+        for a, b in tqdm(dl, desc=f'epoch {ep+1}/{epochs}'):
+            # ---- 1) 判斷誰是 z、誰是 影像/潛向量 ----
+            def _is_z(x):   # DINO/CLIP 特徵通常 (B, D)（2 維）
+                return x.dim() == 2
 
-    for z, lat0 in dl:
-        z = z.to(dec.device); lat0 = lat0.to(dec.device)
-        t = torch.randint(0, sched.config.num_train_timesteps, (z.size(0),), device=dec.device).long()
-        noise = torch.randn_like(lat0)
-        a = sched.alphas_cumprod.to(dec.device)[t].view(-1,1,1,1)
-        lat_t = a.sqrt()*lat0 + (1-a).sqrt()*noise
-        eps_hat = dec(lat_t, z, t)
-        loss = F.mse_loss(eps_hat, noise)
+            if _is_z(a) and not _is_z(b):
+                z, img_or_lat = a, b
+            elif _is_z(b) and not _is_z(a):
+                z, img_or_lat = b, a
+            else:
+                raise ValueError(
+                    f"Dataset batch ambiguous: got shapes a={tuple(a.shape)} b={tuple(b.shape)}; "
+                    "expect one 2D feature (B,D) and one 4D image/latent (B,C,H,W)."
+                )
 
-    # === CLIP 僅作特徵、也不更新權重（仍需保留反傳路徑，故不要 no_grad 包住） ===
-    clip_model, _, _ = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
-    clip_model = clip_model.to(dec.device).eval()
-    clip_model.requires_grad_(False)
+            z = z.to(device, non_blocking=True)
 
-    gstep = 0
-    save_path = Path(save_path or "sd_adapter_final.pt")
-    use_amp = (str(device).startswith("cuda") and torch.cuda.is_available())
+            # ---- 2) 取得 lat0：若輸入是影像 C=3 則 encode；若 C=4 視為已是潛向量 ----
+            if img_or_lat.dim() != 4:
+                raise ValueError(f"Expected BCHW tensor for image/latent, got {tuple(img_or_lat.shape)}")
 
-    while gstep < steps:
-        for z, lat0 in dl:                                     # ← DataLoader 直接給 (z, lat0)
-            gstep += 1
-            z    = z.to(dec.device, non_blocking=True)
-            lat0 = lat0.to(dec.device, non_blocking=True)      # (B, 4, H/8, W/8) 並且已乘 scaling_factor
+            C = img_or_lat.size(1)
+            if C == 4:
+                lat0 = img_or_lat.to(device, non_blocking=True)                    # 已是潛向量
+            elif C == 3:
+                with torch.no_grad():                                              # 影像 → 潛向量
+                    lat0 = dec.encode(img_or_lat.to(device, non_blocking=True))
+            else:
+                raise ValueError(f"Channel C must be 3 (image) or 4 (latent), got C={C}")
 
-            bs = lat0.size(0)
-            t = torch.randint(0, sched.config.num_train_timesteps, (bs,), device=dec.device).long()
-            noise  = torch.randn_like(lat0)
-            alphas = sched.alphas_cumprod.to(dec.device)[t].view(-1,1,1,1)
+            bsz = lat0.size(0)
 
-            lat_t  = alphas.sqrt() * lat0 + (1 - alphas).sqrt() * noise
+            # ---- 3) 前向加噪 ----
+            t = torch.randint(0, timesteps, (bsz,), device=device, dtype=torch.long)
+            noise = torch.randn_like(lat0)
+            sqrt_al = al_bar[t].sqrt().view(-1,1,1,1)
+            sqrt_one_minus_al = (1.0 - al_bar[t]).sqrt().view(-1,1,1,1)
+            lat_t = sqrt_al * lat0 + sqrt_one_minus_al * noise
 
-            with torch.autocast(device_type="cuda", enabled=use_amp):
-                eps_hat = dec(lat_t, z, t)
-                loss_mse = F.mse_loss(eps_hat, noise)
+            # ---- 4) 預測噪聲 + loss（MSE / TV / DINO 語義）----
+            with torch.autocast(device_type=('cuda' if device=='cuda' else 'cpu'), dtype=autocast_dtype):
+                eps_hat = dec(lat_t, z, t)                         # (B,4,H/8,W/8)
 
-                # 從 eps_hat 反推 x0 的 latent → 解碼到像素空間（供 TV / CLIP 用）
-                lat_x0  = (lat_t - (1 - alphas).sqrt() * eps_hat) / alphas.sqrt()
-                x0_pred = dec.decode(lat_x0)                    # 解碼時會自動 / scaling_factor
+                loss = F.mse_loss(eps_hat, noise)                  # ε MSE（Ho et al.）
 
-                loss_tv = _total_variation(x0_pred) if tv_w > 0 else x0_pred.new_tensor(0.0)
+                if recon_w > 0 or tv_w > 0 or clip_w > 0:
+                    lat_x0 = (lat_t - sqrt_one_minus_al * eps_hat) / sqrt_al
+                    x0_pred = dec.decode(lat_x0).clamp(-1, 1)      # [-1,1]
 
-                loss_clip = x0_pred.new_tensor(0.0)
-                if clip_w > 0:
-                    img_in = _clip_preprocess_torch(x0_pred)    # 224 & CLIP normalize
-                    y_clip = clip_model.encode_image(img_in)
-                    y_clip = y_clip / (y_clip.norm(dim=-1, keepdim=True) + 1e-9)
-                    z_clip = z / (z.norm(dim=-1, keepdim=True) + 1e-9)
-                    loss_clip = (1.0 - torch.cosine_similarity(y_clip.float(), z_clip.float()).mean())
+                if recon_w > 0:
+                    with torch.no_grad():
+                        x0_ref = dec.decode(lat0).clamp(-1, 1)     # 以 lat0 解碼當 GT，不需原圖
+                    loss = loss + recon_w * F.l1_loss(x0_pred, x0_ref)
 
-                loss = mse_w * loss_mse + clip_w * loss_clip + tv_w * loss_tv
+                if tv_w > 0:
+                    loss = loss + tv_w * total_variation(x0_pred)
 
+                if clip_w > 0 and (ep % 2 == 0):
+                    x_dino = (x0_pred.float() + 1.0) / 2.0
+                    x_dino = F.interpolate(x_dino, size=dino_size, mode='bilinear', align_corners=False)
+                    x_dino = (x_dino - dino_mean) / dino_std
+                    y_dino = dino_model(x_dino).float()
+                    y_dino = y_dino / (y_dino.norm(dim=-1, keepdim=True) + 1e-9)
+                    z_norm = z / (z.norm(dim=-1, keepdim=True) + 1e-9)
+                    z_norm = z_norm.to(y_dino.dtype)
+                    loss = loss + clip_w * (1.0 - torch.cosine_similarity(y_dino, z_norm).mean())
+
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update()
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
 
-            if gstep % 100 == 0:
-                print(f"[train] step={gstep}/{steps} "
-                      f"total={loss.item():.4f}  mse={loss_mse.item():.4f}  "
-                      f"clip={loss_clip.item():.4f}  tv={loss_tv.item():.6f}")
-            if gstep % 5000 == 0:
-                tmp = save_path.with_name(save_path.stem + f"_{gstep}.pt")
-                torch.save(dec.adapter.state_dict(), tmp)
-            if gstep >= steps:
-                break
+        # Save checkpoint at the end of each epoch
+        ckpt_path = save_dir / f'sd_adapter_ep{ep+1}.pt'
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({'adapter': dec.adapter.state_dict()}, ckpt_path)
+    # Save final adapter weights
+    final_path = save_dir / 'sd_adapter_final.pt'
+    torch.save({'adapter': dec.adapter.state_dict()}, final_path)
+    return final_path
 
-    torch.save(dec.adapter.state_dict(), save_path)
-    print("Saved adapter to", save_path)
-    return save_path
 
-if __name__ == "__main__":
+if __name__ == '__main__':  # pragma: no cover
     import argparse
-    ap = argparse.ArgumentParser(description="Train SD-UNet + CLIP-Adapter decoder (latent diffusion).")
-    ap.add_argument("--store_dir", type=Path, required=True)
-    ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--batch", type=int, default=2)
-    ap.add_argument("--size", type=int, default=512)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--tv_w", type=float, default=1e-5)
-    ap.add_argument("--clip_w", type=float, default=0.1)
-    ap.add_argument("--mse_w", type=float, default=1.0)
+    ap = argparse.ArgumentParser(description="Train StableDiffusionDecoder with CLIP conditioning.")
+    ap.add_argument("--store_dir", type=str, required=True)
     ap.add_argument("--model_name", type=str, default="runwayml/stable-diffusion-v1-5")
-    ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--out", type=Path, default=Path("sd_adapter_final.pt"))
+    ap.add_argument("--out_size", type=int, default=256)
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--timesteps", type=int, default=1000)
+    ap.add_argument("--recon_w", type=float, default=0.05)
+    ap.add_argument("--clip_w", type=float, default=0.1)
+    ap.add_argument("--tv_w", type=float, default=1e-4)
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--save_dir", type=str, default=None)
     args = ap.parse_args()
     train_sd_diffusion(
-        store_dir=args.store_dir,
-        out_size=args.size,
-        steps=args.steps,
-        batch_size=args.batch,
+        store_dir=Path(args.store_dir),
+        out_size=args.out_size,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
         lr=args.lr,
+        timesteps=args.timesteps,
         model_name=args.model_name,
-        tv_w=args.tv_w,
+        recon_w=args.recon_w,
         clip_w=args.clip_w,
-        mse_w=args.mse_w,
+        tv_w=args.tv_w,
         device=args.device,
-        save_path=args.out,
+        save_dir=Path(args.save_dir) if args.save_dir is not None else None,
     )

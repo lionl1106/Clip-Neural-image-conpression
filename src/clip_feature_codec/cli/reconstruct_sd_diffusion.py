@@ -23,6 +23,26 @@ def l2_normalize_np(x, axis=-1, eps=1e-9):
     n = np.linalg.norm(x, axis=axis, keepdims=True)
     return x / np.maximum(n, eps)
 
+def _load_adapter_state(path, device):
+    ckpt = torch.load(path, map_location=device)  # 可選: weights_only=True（PyTorch 2.0+）
+    # 1) 解包常見容器
+    if isinstance(ckpt, dict) and 'adapter' in ckpt and isinstance(ckpt['adapter'], (dict, torch.nn.modules.container.OrderedDict)):
+        sd = ckpt['adapter']
+    elif isinstance(ckpt, dict) and 'state_dict' in ckpt and isinstance(ckpt['state_dict'], (dict, torch.nn.modules.container.OrderedDict)):
+        sd = ckpt['state_dict']
+    else:
+        sd = ckpt
+
+    # 2) 移除常見前綴（DDP/包裝）
+    def strip_prefix(d, pfx):
+        if any(k.startswith(pfx) for k in d.keys()):
+            return { (k[len(pfx):] if k.startswith(pfx) else k): v for k, v in d.items() }
+        return d
+    sd = strip_prefix(sd, 'module.')
+    sd = strip_prefix(sd, 'adapter.')
+
+    return sd
+
 def _clip_preprocess_torch(x: torch.Tensor, size: int = 224) -> torch.Tensor:
     # x: [-1,1] BCHW → CLIP normalize
     x = (x.clamp(-1,1) + 1.0) / 2.0
@@ -53,6 +73,11 @@ def main():
                     help="open_clip 影像編碼器架構（需和 bitstream 的 CLIP 一致或相近）")
     ap.add_argument("--inv_clip_ckpt", type=str, default="openai",
                     help="open_clip 的 pretrained 名稱（如 openai / laion2b_s34b_b79k 等）")
+    ap.add_argument("--inv_backend", type=str, default="auto",
+                choices=["auto", "dino", "clip"],
+                help="inversion 特徵後端：auto 會依 bitstream 維度自動選擇")
+    ap.add_argument("--inv_dino_model", type=str, default="vit_base_patch14_dinov2.lvd142m",
+                help="timm 的 DINOv2 模型名，用於 inversion（若選 dino 或 auto→dino）")
     args = ap.parse_args()
 
     # 1) 讀 meta + 正確解碼 bitstream
@@ -68,25 +93,58 @@ def main():
 
     # 3) 建立 decoder（VAE/UNet 凍結）、載入 adapter
     dec = StableDiffusionDecoder(model_name=args.model_name, device=str(args.device), clip_dim=dim)
-    dec.adapter.load_state_dict(torch.load(args.adapter, map_location=dec.device))
+    sd = _load_adapter_state(args.adapter, dec.device)
+    missing, unexpected = dec.adapter.load_state_dict(sd, strict=False)  # 如需嚴格可改 True
+    if missing or unexpected:
+        print(f"[warn] load_state_dict: missing={missing}, unexpected={unexpected}")
+
     unet, vae, scheduler = dec.unet, dec.vae, dec.noise_scheduler
     unet.eval(); vae.eval()
 
     # 4) 準備 CLIP 編碼器（只在 inv_weight>0 才建）
     inv_use = args.inv_weight > 0
     if inv_use:
-        import open_clip
-        clip_model, _, _ = open_clip.create_model_and_transforms(args.inv_clip_arch, pretrained=args.inv_clip_ckpt)
-        clip_model = clip_model.to(dec.device).eval()
+        backend = args.inv_backend
+        if backend == "auto":
+            # 512 → CLIP；384/768/1024/1536 → DINOv2
+            backend = "clip" if dim == 512 else "dino"
 
-        def _clip_encode_img(x_img: torch.Tensor) -> torch.Tensor:
-            x_in = _clip_preprocess_torch(x_img)             # BCHW
-            y = clip_model.encode_image(x_in)
-            return y / (y.norm(dim=-1, keepdim=True) + 1e-9)
+        if backend == "clip":
+            if dim != 512:
+                raise ValueError(f"inv_backend=clip 但 bitstream 維度是 {dim}，請改用 --inv_backend dino（或 auto）")
+            import open_clip
+            clip_model, _, _ = open_clip.create_model_and_transforms(
+                args.inv_clip_arch, pretrained=args.inv_clip_ckpt
+            )
+            clip_model = clip_model.to(dec.device).eval()
 
-        z_tgt = torch.from_numpy(z).to(dec.device)           # (1, dim)
-        z_tgt = z_tgt / (z_tgt.norm(dim=-1, keepdim=True) + 1e-9)
+            def _encode_img(x_img: torch.Tensor) -> torch.Tensor:
+                x_in = _clip_preprocess_torch(x_img)                      # BCHW → CLIP 正規化
+                y = clip_model.encode_image(x_in)                         # (B, 512)
+                return torch.nn.functional.normalize(y.float(), dim=-1)   # L2
 
+        elif backend == "dino":
+            import timm
+            from timm.data import resolve_model_data_config
+            dino = timm.create_model(args.inv_dino_model, pretrained=True, num_classes=0).to(dec.device).eval()
+            cfg = resolve_model_data_config(dino)
+            mean = torch.tensor(cfg["mean"], device=dec.device).view(1,3,1,1)
+            std  = torch.tensor(cfg["std"],  device=dec.device).view(1,3,1,1)
+            size = (cfg["input_size"][-2], cfg["input_size"][-1])
+
+            def _encode_img(x_img: torch.Tensor) -> torch.Tensor:
+                x_in = (x_img.clamp(-1,1) + 1.0) / 2.0
+                x_in = torch.nn.functional.interpolate(x_in, size=size, mode="bilinear", align_corners=False)
+                x_in = (x_in - mean) / std
+                y = dino(x_in)                                            # (B, 768/1024/1536)
+                return torch.nn.functional.normalize(y.float(), dim=-1)   # L2
+        else:
+            raise ValueError(f"Unknown inv_backend: {backend}")
+
+        # 目標特徵（由 bitstream 反量化而來），與上面 encoder 尺寸對齊
+        z_tgt = torch.from_numpy(z).to(dec.device)                         # (1, dim)
+        z_tgt = torch.nn.functional.normalize(z_tgt, dim=-1)
+        
     # 5) 展開 DDIM 抽樣 + CFG +（可選）CLIP 引導反饋
     B, C, H, W = 1, 4, args.size // 8, args.size // 8
     scheduler.set_timesteps(args.steps, device=dec.device)
@@ -113,10 +171,10 @@ def main():
                 x0_img = vae.decode((lat_x0 / dec.scaling_factor)).sample.clamp(-1,1)
 
                 # CLIP 相似度作為“分類器”→ 以梯度上升最大化 cos 相似（這就是 CLIP-guided diffusion 的精神）
-                y_clip = _clip_encode_img(x0_img)
-                clip_loss = (1.0 - torch.cosine_similarity(y_clip.float(), z_tgt.float()).mean())
-                g = torch.autograd.grad(clip_loss, lat, retain_graph=False)[0]   # dL/d(lat)
-                # 步長用 inv_weight，並做單位化避免爆炸
+                y_feat = _encode_img(x0_img)                      # (B, dim)
+                z_b = z_tgt.expand(y_feat.size(0), -1)            # (B, dim)
+                feat_loss = (1.0 - torch.cosine_similarity(y_feat, z_b, dim=-1).mean())
+                g = torch.autograd.grad(feat_loss, lat, retain_graph=False)[0]
                 lat = (lat - args.inv_weight * g / (g.norm() + 1e-8)).detach()
 
             # (c) DDIM 前進一步
