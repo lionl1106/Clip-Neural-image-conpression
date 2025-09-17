@@ -184,8 +184,19 @@ def main():
     with torch.no_grad(), torch.autocast(device_type="cuda", enabled=(str(args.device).startswith("cuda") and torch.cuda.is_available())):
         img = vae.decode((lat / dec.scaling_factor)).sample
     out = (img[0].clamp(-1,1).add(1).mul(127.5).to(torch.uint8).permute(1,2,0).cpu().numpy())
-    Image.fromarray(out).save(args.out)
-    print("Saved to", args.out)
+
+    def _fmt_num(x: float) -> str:
+      return f"{x:g}"
+    
+    if args.out == Path("recon.png"):
+        stem = args.bitstream.stem            # 例如 0001.clp → stem = "0001"
+        out_name = f"{stem}-{args.steps}-{_fmt_num(args.guidance)}-{_fmt_num(args.inv_weight)}.png"
+        out_path = args.bitstream.with_name(out_name)  # 存在 bitstream 同資料夾
+    else:
+        out_path = args.out
+
+    Image.fromarray(out).save(out_path)
+    print("Saved to", out_path)
 
 if __name__ == "__main__":
     main()
