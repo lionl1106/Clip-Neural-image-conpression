@@ -204,12 +204,12 @@ def train_sd_diffusion(
                 if recon_w > 0:
                     with torch.no_grad():
                         x0_ref = dec.decode(lat0).clamp(-1, 1)     # 以 lat0 解碼當 GT，不需原圖
-                    loss = loss + recon_w * F.l1_loss(x0_pred, x0_ref)
+                    loss = loss + recon_w * F.mse_loss(x0_pred, x0_ref)
 
                 if tv_w > 0:
                     loss = loss + tv_w * total_variation(x0_pred)
 
-                if clip_w > 0 and (ep % 2 == 0):
+                if clip_w > 0:
                     x_dino = (x0_pred.float() + 1.0) / 2.0
                     x_dino = F.interpolate(x_dino, size=dino_size, mode='bilinear', align_corners=False)
                     x_dino = (x_dino - dino_mean) / dino_std
