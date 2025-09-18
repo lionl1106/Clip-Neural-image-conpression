@@ -52,6 +52,10 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.backends.cudnn as cudnn
 
 from diffusers.models.attention_processor import AttnProcessor2_0
+import lpips
+lpips_loss = lpips.LPIPS(net='vgg').to(device).eval()  # popular backbone per paper
+for p in lpips_loss.parameters():
+    p.requires_grad_(False)
 
 cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")  # Ampere+ 會用到 TF32
@@ -72,7 +76,11 @@ class StoreDataset(Dataset):
         z = torch.from_numpy((q.astype("float32")*self.scale+self.zero)).float()
         z = z / (z.norm(dim=-1, keepdim=True)+1e-9)
         lat = torch.from_numpy(np.load(rec["latent"])["lat"]).float()  # shape (4, H/8, W/8)
-        return z, lat
+        x = None
+        if "image" in rec:
+            img = Image.open(rec["image"]).convert("RGB")
+            x = torch.from_numpy(np.array(img).astype("float32")/127.5 - 1.0).permute(2,0,1)  # [-1,1], CxHxW
+        return z, lat, x  # x may be None
 
 
 def total_variation(x: torch.Tensor) -> torch.Tensor:
@@ -92,6 +100,7 @@ def train_sd_diffusion(
     model_name: str = "runwayml/stable-diffusion-v1-5",
     recon_w: float = 0.05,
     clip_w: float = 0.1,
+    perc_w: float = 0.1,
     tv_w: float = 1e-4,
     device: str = 'cuda',
     save_dir: Optional[Path] = None,
@@ -136,7 +145,6 @@ def train_sd_diffusion(
         pass
     dec.unet.to(memory_format=torch.channels_last)
     
-
     # Ensure scheduler timesteps match requested training timesteps
     # dec.scheduler.set_timesteps(timesteps)
     sched = dec.noise_scheduler
@@ -208,6 +216,7 @@ def train_sd_diffusion(
             lat_t = sqrt_al * lat0 + sqrt_one_minus_al * noise
             lat_t = lat_t.to(memory_format=torch.channels_last)
 
+
             # ---- forward & losses ----
             with torch.autocast(device_type=('cuda' if device=='cuda' else 'cpu'), dtype=autocast_dtype):
                 eps_hat = dec(lat_t, z, t)
@@ -243,6 +252,35 @@ def train_sd_diffusion(
                     loss_clip = (1.0 - torch.cosine_similarity(y_dino, z_norm).mean())
                     loss = loss + clip_w * loss_clip
 
+                perc_w = 0.05       # tune
+                perc_every = 10     # compute every N steps to save time
+
+                # ... inside the batch loop
+                # unpack batch to accept optional GT image
+                try:
+                    (a, b, x_gt) = (a, b, x_gt)   # no-op if you already unpacked; keep for clarity
+                except Exception:
+                    x_gt = None
+
+                # after you produce x0_pred in [-1,1], shape [B,3,H,W]
+                if perc_w > 0 and (global_step % perc_every == 0) and x_gt is not None:
+                    # x_gt: [B,3,H0,W0] in [-1,1]. Match spatial size to x0_pred for LPIPS.
+                    if x_gt.dim() == 3:  # single image case
+                        x_gt = x_gt.unsqueeze(0)
+                    x_gt = x_gt.to(device, non_blocking=True).float()
+
+                    # Resize GT to predicted size (LPIPS expects same H,W; it does not auto-resize)
+                    H, W = x0_pred.shape[-2:]
+                    if x_gt.shape[-2:] != (H, W):
+                        x_gt_resized = F.interpolate(x_gt, size=(H, W), mode='bilinear', align_corners=False)
+                    else:
+                        x_gt_resized = x_gt
+
+                    # Both inputs must be RGB in [-1,1]; your x0_pred already is.
+                    lp = lpips_loss(x0_pred, x_gt_resized).mean()
+                    loss = loss + perc_w * lp
+
+
             # ---- backward / step ----
             scaler.scale(loss).backward()
             scaler.step(opt); scaler.update()
@@ -255,6 +293,7 @@ def train_sd_diffusion(
             v_tv   = float(loss_tv.detach().cpu())  if loss_tv  is not None else 0.0
             v_clip = float(loss_clip.detach().cpu()) if loss_clip is not None else 0.0
             v_tot  = float(loss.detach().cpu())
+            v_lpips = float(lp.detach().cpu())
 
             epoch_tot += v_tot; epoch_mse += v_mse; epoch_rec += v_rec; epoch_tv += v_tv; epoch_clip += v_clip
 
@@ -270,9 +309,11 @@ def train_sd_diffusion(
             if writer is not None:
                 writer.add_scalar("loss/total", v_tot, global_step)
                 writer.add_scalar("loss/mse",   v_mse, global_step)
+                writer.add_scalar("loss/lpips_gt", v_lpips, global_step)
                 if loss_rec  is not None: writer.add_scalar("loss/recon_L1", v_rec,  global_step)
                 if loss_tv   is not None: writer.add_scalar("loss/tv",       v_tv,   global_step)
                 if loss_clip is not None: writer.add_scalar("loss/clip_align", v_clip, global_step)
+                if perc_w is not None: writer.add_scalar("loss/lpips_gt", v_lpips, global_step)
             global_step += 1
 
         # end for batch
@@ -310,6 +351,7 @@ if __name__ == '__main__':  # pragma: no cover
     ap.add_argument("--recon_w", type=float, default=0.05)
     ap.add_argument("--clip_w", type=float, default=0.1)
     ap.add_argument("--tv_w", type=float, default=1e-4)
+    ap.add_argument("--perc_w", type=float, default=0.1)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--save_dir", type=str, default=None)
     args = ap.parse_args()
@@ -324,6 +366,7 @@ if __name__ == '__main__':  # pragma: no cover
         recon_w=args.recon_w,
         clip_w=args.clip_w,
         tv_w=args.tv_w,
+        perc_w=args.perc_w,
         device=args.device,
         save_dir=Path(args.save_dir) if args.save_dir is not None else None,
     )

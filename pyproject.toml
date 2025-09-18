@@ -21,7 +21,7 @@ dependencies = [
     "zstandard>=0.22.0",
     "lpips>=0.1.4",
     "scikit-image>=0.22.0",
-
+    "lpips",
     "diffusers>=0.25.0",
     "transformers>=4.40.0",
     "accelerate>=0.28.0",
