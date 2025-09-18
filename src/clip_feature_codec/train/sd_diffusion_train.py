@@ -30,7 +30,7 @@ Usage example::
 
 from __future__ import annotations
 
-import json
+import json, os
 from pathlib import Path
 from typing import Optional
 
@@ -49,6 +49,12 @@ from timm.data import resolve_model_data_config, create_transform
 from ..models.sd_decoder import StableDiffusionDecoder
 from ..io.bitstream import read_bitstream  # local import to avoid cycle
 from torch.utils.tensorboard import SummaryWriter
+import torch.backends.cudnn as cudnn
+
+from diffusers.models.attention_processor import AttnProcessor2_0
+
+cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")  # Ampere+ 會用到 TF32
 
 class StoreDataset(Dataset):
     def __init__(self, store_dir: Path):
@@ -115,18 +121,33 @@ def train_sd_diffusion(
     """
     save_dir = Path(save_dir or store_dir)
     ds = StoreDataset(store_dir)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    dl = DataLoader(
+        ds, batch_size=batch_size, shuffle=True,
+        num_workers=max(2, (os.cpu_count() or 8)//2),
+        pin_memory=True, persistent_workers=True, prefetch_factor=4
+    )
     # Instantiate decoder
     clip_dim = int(ds.zero.shape[0])
     dec = StableDiffusionDecoder(model_name=model_name, device=device, clip_dim=clip_dim).to(device)
+    dec.unet = torch.compile(dec.unet, mode="reduce-overhead")  # 或視情況試 "max-autotune"
+    try:
+        dec.unet.set_attn_processor(AttnProcessor2_0())
+    except Exception:
+        pass
+    dec.unet.to(memory_format=torch.channels_last)
+    
+
     # Ensure scheduler timesteps match requested training timesteps
     # dec.scheduler.set_timesteps(timesteps)
     sched = dec.noise_scheduler
     
     # Only train the adapter parameters
-    opt = torch.optim.AdamW(dec.adapter.parameters(), lr=lr)
+    use_fused = (device == "cuda" and hasattr(torch.optim.AdamW, "fused"))
+    opt = torch.optim.AdamW(dec.adapter.parameters(), lr=lr, fused=use_fused)
     scaler = torch.cuda.amp.GradScaler(enabled=(device == 'cuda'))
-    autocast_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    use_bf16 = (device=="cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
+    autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
     # ----------------------------------------------------------------------
     # DINOv2 model for perceptual alignment
     #
@@ -137,6 +158,7 @@ def train_sd_diffusion(
     # We configure the model with ``num_classes=0`` to obtain the pooled
     # embeddings directly.  The associated data configuration supplies the
     # mean, standard deviation and input size for normalising images.
+    
     dino_model = timm.create_model(
         'vit_base_patch14_dinov2.lvd142m',
         pretrained=True,
@@ -175,6 +197,7 @@ def train_sd_diffusion(
                     lat0 = dec.encode(img_or_lat.to(device, non_blocking=True))
             else:
                 raise ValueError(...)
+            lat0  = lat0.to(memory_format=torch.channels_last)
             bsz = lat0.size(0)
 
             # ---- noise ----
@@ -183,6 +206,7 @@ def train_sd_diffusion(
             sqrt_al = al_bar[t].sqrt().view(-1,1,1,1)
             sqrt_one_minus_al = (1.0 - al_bar[t]).sqrt().view(-1,1,1,1)
             lat_t = sqrt_al * lat0 + sqrt_one_minus_al * noise
+            lat_t = lat_t.to(memory_format=torch.channels_last)
 
             # ---- forward & losses ----
             with torch.autocast(device_type=('cuda' if device=='cuda' else 'cpu'), dtype=autocast_dtype):
