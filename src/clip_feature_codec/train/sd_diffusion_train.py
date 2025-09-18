@@ -189,7 +189,7 @@ def train_sd_diffusion(
         pbar = tqdm(dl, desc=f'epoch {ep+1}/{epochs}', leave=False)
         epoch_tot = epoch_mse = epoch_rec = epoch_tv = epoch_clip = 0.0  # NEW
 
-        for a, b in pbar:
+        for a, b, x_gt in pbar:
             # ---- batch prep (unchanged) ----
             def _is_z(x): return x.dim() == 2
             if _is_z(a) and not _is_z(b): z, img_or_lat = a, b
@@ -296,7 +296,7 @@ def train_sd_diffusion(
             v_tot  = float(loss.detach().cpu())
             v_lpips = float(lp.detach().cpu())
 
-            epoch_tot += v_tot; epoch_mse += v_mse; epoch_rec += v_rec; epoch_tv += v_tv; epoch_clip += v_clip
+            epoch_tot += v_tot; epoch_mse += v_mse; epoch_rec += v_rec; epoch_tv += v_tv; epoch_clip += v_clip; epoch_lpips += v_lpips
 
             pbar.set_postfix(
                 tot=f"{v_tot:.4f}",
@@ -314,7 +314,7 @@ def train_sd_diffusion(
                 if loss_rec  is not None: writer.add_scalar("loss/recon_L1", v_rec,  global_step)
                 if loss_tv   is not None: writer.add_scalar("loss/tv",       v_tv,   global_step)
                 if loss_clip is not None: writer.add_scalar("loss/clip_align", v_clip, global_step)
-                if perc_w is not None: writer.add_scalar("loss/lpips_gt", v_lpips, global_step)
+                if lp is not None: writer.add_scalar("loss/lpips_gt", v_lpips, global_step)
             global_step += 1
 
         # end for batch
@@ -323,7 +323,7 @@ def train_sd_diffusion(
         batches = len(dl)
         print(f"[epoch {ep+1}/{epochs}] "
             f"tot={epoch_tot/batches:.4f}  mse={epoch_mse/batches:.4f}  "
-            f"rec={epoch_rec/batches:.4f}  tv={epoch_tv/batches:.5f}  clip={epoch_clip/batches:.4f}")
+            f"rec={epoch_rec/batches:.4f}  tv={epoch_tv/batches:.5f}  clip={epoch_clip/batches:.4f} lpips={epoch_lpips/batches:.4f}")
 
         if writer is not None:
             writer.add_scalar("epoch/avg_total", epoch_tot/batches, ep+1)
