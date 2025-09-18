@@ -53,9 +53,7 @@ import torch.backends.cudnn as cudnn
 
 from diffusers.models.attention_processor import AttnProcessor2_0
 import lpips
-lpips_loss = lpips.LPIPS(net='vgg').to(device).eval()  # popular backbone per paper
-for p in lpips_loss.parameters():
-    p.requires_grad_(False)
+
 
 cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")  # Ampere+ 會用到 TF32
@@ -183,6 +181,9 @@ def train_sd_diffusion(
     al_bar = sched.alphas_cumprod.to(dec.device)
     # al_bar = dec.scheduler.alphas_cumprod.to(device)  # shape (T,)
     writer = SummaryWriter(log_dir=str((save_dir or Path(store_dir)) / "runs"))  # NEW (optional)
+    lpips_loss = lpips.LPIPS(net='vgg').to(device).eval()  # popular backbone per paper
+    for p in lpips_loss.parameters():
+        p.requires_grad_(False)
     global_step = 0  # NEW
     for ep in range(epochs):
         pbar = tqdm(dl, desc=f'epoch {ep+1}/{epochs}', leave=False)
