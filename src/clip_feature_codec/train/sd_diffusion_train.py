@@ -48,6 +48,7 @@ from timm.data import resolve_model_data_config, create_transform
 
 from ..models.sd_decoder import StableDiffusionDecoder
 from ..io.bitstream import read_bitstream  # local import to avoid cycle
+from torch.utils.tensorboard import SummaryWriter
 
 class StoreDataset(Dataset):
     def __init__(self, store_dir: Path):
@@ -151,79 +152,118 @@ def train_sd_diffusion(
     # Precompute alpha_bar schedule for latent diffusion
     al_bar = sched.alphas_cumprod.to(dec.device)
     # al_bar = dec.scheduler.alphas_cumprod.to(device)  # shape (T,)
+    writer = SummaryWriter(log_dir=str((save_dir or Path(store_dir)) / "runs"))  # NEW (optional)
+    global_step = 0  # NEW
     for ep in range(epochs):
-        for a, b in tqdm(dl, desc=f'epoch {ep+1}/{epochs}'):
-            # ---- 1) 判斷誰是 z、誰是 影像/潛向量 ----
-            def _is_z(x):   # DINO/CLIP 特徵通常 (B, D)（2 維）
-                return x.dim() == 2
+        pbar = tqdm(dl, desc=f'epoch {ep+1}/{epochs}', leave=False)
+        epoch_tot = epoch_mse = epoch_rec = epoch_tv = epoch_clip = 0.0  # NEW
 
-            if _is_z(a) and not _is_z(b):
-                z, img_or_lat = a, b
-            elif _is_z(b) and not _is_z(a):
-                z, img_or_lat = b, a
+        for a, b in pbar:
+            # ---- batch prep (unchanged) ----
+            def _is_z(x): return x.dim() == 2
+            if _is_z(a) and not _is_z(b): z, img_or_lat = a, b
+            elif _is_z(b) and not _is_z(a): z, img_or_lat = b, a
             else:
-                raise ValueError(
-                    f"Dataset batch ambiguous: got shapes a={tuple(a.shape)} b={tuple(b.shape)}; "
-                    "expect one 2D feature (B,D) and one 4D image/latent (B,C,H,W)."
-                )
-
+                raise ValueError(...)
             z = z.to(device, non_blocking=True)
-
-            # ---- 2) 取得 lat0：若輸入是影像 C=3 則 encode；若 C=4 視為已是潛向量 ----
-            if img_or_lat.dim() != 4:
-                raise ValueError(f"Expected BCHW tensor for image/latent, got {tuple(img_or_lat.shape)}")
-
+            if img_or_lat.dim() != 4: raise ValueError(...)
             C = img_or_lat.size(1)
             if C == 4:
-                lat0 = img_or_lat.to(device, non_blocking=True)                    # 已是潛向量
+                lat0 = img_or_lat.to(device, non_blocking=True)
             elif C == 3:
-                with torch.no_grad():                                              # 影像 → 潛向量
+                with torch.no_grad():
                     lat0 = dec.encode(img_or_lat.to(device, non_blocking=True))
             else:
-                raise ValueError(f"Channel C must be 3 (image) or 4 (latent), got C={C}")
-
+                raise ValueError(...)
             bsz = lat0.size(0)
 
-            # ---- 3) 前向加噪 ----
+            # ---- noise ----
             t = torch.randint(0, timesteps, (bsz,), device=device, dtype=torch.long)
             noise = torch.randn_like(lat0)
             sqrt_al = al_bar[t].sqrt().view(-1,1,1,1)
             sqrt_one_minus_al = (1.0 - al_bar[t]).sqrt().view(-1,1,1,1)
             lat_t = sqrt_al * lat0 + sqrt_one_minus_al * noise
 
-            # ---- 4) 預測噪聲 + loss（MSE / TV / DINO 語義）----
+            # ---- forward & losses ----
             with torch.autocast(device_type=('cuda' if device=='cuda' else 'cpu'), dtype=autocast_dtype):
-                eps_hat = dec(lat_t, z, t)                         # (B,4,H/8,W/8)
+                eps_hat = dec(lat_t, z, t)
 
-                loss = F.mse_loss(eps_hat, noise)                  # ε MSE（Ho et al.）
+                loss_mse = F.mse_loss(eps_hat, noise)     # ε-MSE (simple loss)
+                loss = loss_mse
 
-                if recon_w > 0 or tv_w > 0 or clip_w > 0:
+                need_decode = (recon_w > 0 or tv_w > 0 or clip_w > 0)
+                if need_decode:
                     lat_x0 = (lat_t - sqrt_one_minus_al * eps_hat) / sqrt_al
-                    x0_pred = dec.decode(lat_x0).clamp(-1, 1)      # [-1,1]
+                    x0_pred = dec.decode(lat_x0).clamp(-1, 1)
 
+                loss_rec = x0_ref = None
                 if recon_w > 0:
                     with torch.no_grad():
-                        x0_ref = dec.decode(lat0).clamp(-1, 1)     # 以 lat0 解碼當 GT，不需原圖
-                    loss = loss + recon_w * F.mse_loss(x0_pred, x0_ref)
+                        x0_ref = dec.decode(lat0).clamp(-1, 1)
+                    loss_rec = F.mse_loss(x0_pred, x0_ref)
+                    loss = loss + recon_w * loss_rec
 
+                loss_tv = None
                 if tv_w > 0:
-                    loss = loss + tv_w * total_variation(x0_pred)
+                    loss_tv = total_variation(x0_pred)
+                    loss = loss + tv_w * loss_tv
 
-                if clip_w > 0:
+                loss_clip = None
+                if clip_w > 0 and (ep % 1 == 0):
                     x_dino = (x0_pred.float() + 1.0) / 2.0
                     x_dino = F.interpolate(x_dino, size=dino_size, mode='bilinear', align_corners=False)
                     x_dino = (x_dino - dino_mean) / dino_std
                     y_dino = dino_model(x_dino).float()
                     y_dino = y_dino / (y_dino.norm(dim=-1, keepdim=True) + 1e-9)
-                    z_norm = z / (z.norm(dim=-1, keepdim=True) + 1e-9)
-                    z_norm = z_norm.to(y_dino.dtype)
-                    loss = loss + clip_w * (1.0 - torch.cosine_similarity(y_dino, z_norm).mean())
+                    z_norm = (z / (z.norm(dim=-1, keepdim=True) + 1e-9)).to(y_dino.dtype)
+                    loss_clip = (1.0 - torch.cosine_similarity(y_dino, z_norm).mean())
+                    loss = loss + clip_w * loss_clip
 
+            # ---- backward / step ----
             scaler.scale(loss).backward()
             scaler.step(opt); scaler.update()
             opt.zero_grad(set_to_none=True)
 
-        # Save checkpoint at the end of each epoch
+            # ---- live metrics on tqdm ----  # NEW
+            # convert Nones to 0 for display/averaging
+            v_mse  = float(loss_mse.detach().cpu())
+            v_rec  = float(loss_rec.detach().cpu()) if loss_rec is not None else 0.0
+            v_tv   = float(loss_tv.detach().cpu())  if loss_tv  is not None else 0.0
+            v_clip = float(loss_clip.detach().cpu()) if loss_clip is not None else 0.0
+            v_tot  = float(loss.detach().cpu())
+
+            epoch_tot += v_tot; epoch_mse += v_mse; epoch_rec += v_rec; epoch_tv += v_tv; epoch_clip += v_clip
+
+            pbar.set_postfix(
+                tot=f"{v_tot:.4f}",
+                mse=f"{v_mse:.4f}",
+                rec=f"{v_rec:.4f}",
+                tv=f"{v_tv:.5f}",
+                clip=f"{v_clip:.4f}"
+            )  # shows on the bar :contentReference[oaicite:1]{index=1}
+
+            # ---- TensorBoard per step (optional) ----  # NEW
+            if writer is not None:
+                writer.add_scalar("loss/total", v_tot, global_step)
+                writer.add_scalar("loss/mse",   v_mse, global_step)
+                if loss_rec  is not None: writer.add_scalar("loss/recon_L1", v_rec,  global_step)
+                if loss_tv   is not None: writer.add_scalar("loss/tv",       v_tv,   global_step)
+                if loss_clip is not None: writer.add_scalar("loss/clip_align", v_clip, global_step)
+            global_step += 1
+
+        # end for batch
+
+        # ---- epoch summary print + TensorBoard ----  # NEW
+        batches = len(dl)
+        print(f"[epoch {ep+1}/{epochs}] "
+            f"tot={epoch_tot/batches:.4f}  mse={epoch_mse/batches:.4f}  "
+            f"rec={epoch_rec/batches:.4f}  tv={epoch_tv/batches:.5f}  clip={epoch_clip/batches:.4f}")
+
+        if writer is not None:
+            writer.add_scalar("epoch/avg_total", epoch_tot/batches, ep+1)
+            writer.flush()
+
+        # Save checkpoint (unchanged)
         ckpt_path = save_dir / f'sd_adapter_ep{ep+1}.pt'
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({'adapter': dec.adapter.state_dict()}, ckpt_path)
